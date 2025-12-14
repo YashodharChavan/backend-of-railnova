@@ -340,7 +340,11 @@ app.post("/api/login", async (req, res) => {
         maxAge: 24 * 60 * 60 * 1000
       });
 
-      return res.json({ success: true });
+      return res.json({
+        success: true,
+        token, // 🔑 REQUIRED for Bearer auth
+      });
+
     } else {
       f
       return res.json({ success: false, message: "Invalid username or password" });
