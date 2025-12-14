@@ -542,7 +542,7 @@ app.get("/api/summary/:type", async (req, res) => {
   }
 });
 
-app.get("/api/get-user-and-role", authenticateUser, (req, res) => {
+app.get("/api/get-user-and-role", (req, res) => {
   res.json({
     username: req.user.username,
     role: req.user.role,
