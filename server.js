@@ -1,3 +1,4 @@
+import NodeCache from 'node-cache';
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -25,14 +26,28 @@ const upload = multer({
   },
 });
 
+const allowedOrigins = [
+  "https://rail-nova.vercel.app",
+  "http://localhost:5173"
+];
+
 // Middleware
 app.use(cookieParser());
 app.use(
   cors({
-    origin: "https://rail-nova.vercel.app",
-    methods: ["GET", "POST"],
+    origin: function (origin, callback) {
+      // allow non-browser tools like Postman
+      if (!origin) return callback(null, true);
+
+      if (allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true
   })
 );
 
@@ -57,10 +72,304 @@ async function connectDB() {
     supabase = await createClient(supabaseUrl, supabaseAnonKey, { global: { fetch } })
 
     // db = await postgres(connectionString)
+    console.log("database connected successfully")
   } catch (error) {
+    console.error("Database connection error:", error);
     process.exit(1);
   }
 }
+
+function isDSL(loco) {
+  if (!loco) return false;
+  const prefixes = ["11", "12", "13", "14", "49", "69", "70"];
+  return prefixes.some(prefix => loco.startsWith(prefix));
+}
+
+app.get("/analysis/locos", async (req, res) => {
+  const tables = [
+    "sc_wadi", "wadi_sc", "gtl_wadi", "wadi_gtl", "ubl_hg", "hg_ubl",
+    "ltrr_sc", "sc_ltrr", "pune_dd", "dd_pune", "mrj_pune", "pune_mrj",
+    "sc_tjsp", "tjsp_sc"
+  ];
+
+  try {
+    const cacheKey = 'locos_stats';
+    const cachedData = cache.get(cacheKey);
+    if (cachedData) return res.json(cachedData);
+
+    const { data, error } = await supabase
+      .from('analysis_locos')
+      .select('route, loco1, loco2');
+
+    if (error) throw error;
+
+    const tableCounts = {};
+    tables.forEach(table => {
+      tableCounts[table] = { dslTotal: 0, acTotal: 0, dslMulti: 0, acMulti: 0 };
+    });
+
+    (data || []).forEach(row => {
+      if (!tableCounts[row.route]) return;
+
+      const l1 = row.loco1?.trim();
+      const l2 = row.loco2?.trim();
+
+      // count loco1
+      if (l1) {
+        if (isDSL(l1)) {
+          tableCounts[row.route].dslTotal++;
+        } else {
+          tableCounts[row.route].acTotal++;
+        }
+      }
+
+      // count loco2
+      if (l2) {
+        if (isDSL(l2)) {
+          tableCounts[row.route].dslTotal++;   // add to total
+          tableCounts[row.route].dslMulti++;   // add to multi
+        } else {
+          tableCounts[row.route].acTotal++;
+          tableCounts[row.route].acMulti++;
+        }
+      }
+    });
+
+    const results = tables.map(table => ({
+      route: table,
+      DSL: {
+        total: tableCounts[table].dslTotal,
+        multi: tableCounts[table].dslMulti
+      },
+      AC: {
+        total: tableCounts[table].acTotal,
+        multi: tableCounts[table].acMulti
+      }
+    }));
+
+    cache.set(cacheKey, results);
+    res.json(results);
+  } catch (err) {
+    console.error("Error in /analysis/locos:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/wagon-totals", async (req, res) => {
+  const retry = async (fn, retries = 3, delay = 1000) => {
+    for (let i = 0; i < retries; i++) {
+      try {
+        return await fn();
+      } catch (err) {
+        if (i === retries - 1) throw err;
+        console.warn(`Retry ${i + 1}/${retries} failed: ${err.message}`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  };
+
+  try {
+    // Query the view directly
+    console.time('Supabase wagon-totals query');
+    const { data, error } = await retry(async () => {
+      return await supabase
+        .from('wagon_totals_data')
+        .select('wagon, isloaded')
+        .range(0, 999); // Limit to 1000 rows
+    });
+    console.timeEnd('Supabase wagon-totals query');
+
+    if (error) {
+      console.error('Error fetching view:', {
+        message: error.message,
+        details: error.details || 'No details provided',
+        hint: error.hint || 'No hint provided',
+        code: error.code || 'No code provided'
+      });
+      throw error;
+    }
+
+    // Log raw data for debugging
+    console.log('Supabase raw data length:', data?.length || 0);
+    console.log('Supabase raw data sample:', data?.slice(0, 5));
+
+    // Initialize totals
+    let totalLoaded = 0;
+    let totalEmpty = 0;
+
+    // Process rows
+    (data || []).forEach(row => {
+      if (row.isloaded === 'L') {
+        totalLoaded += Number(row.wagon) || 0; // Ensure wagon is treated as integer
+      } else if (row.isloaded === 'E') {
+        totalEmpty += Number(row.wagon) || 0;
+      }
+    });
+
+    const resultData = [
+      { name: "Loaded Wagons", value: totalLoaded },
+      { name: "Empty Wagons", value: totalEmpty }
+    ];
+
+    const response = { success: true, data: resultData };
+
+    res.json(response);
+  } catch (err) {
+    console.error("Error in /api/wagon-totals:", {
+      message: err.message,
+      stack: err.stack || 'No stack trace',
+      details: err.details || 'No additional details',
+      code: err.code || 'No code provided'
+    });
+    res.status(500).json({
+      success: false,
+      message: "Server error fetching wagon totals",
+      error: err.message
+    });
+  }
+});
+
+
+app.get("/api/ic-stats", async (req, res) => {
+  const retry = async (fn, retries = 3, delay = 1000) => {
+    for (let i = 0; i < retries; i++) {
+      try {
+        return await fn();
+      } catch (err) {
+        if (i === retries - 1) throw err;
+        console.warn(`Retry ${i + 1}/${retries} failed: ${err.message}`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  };
+
+  try {
+    // Query the view directly
+    console.time('Supabase ic-stats query');
+    const { data, error } = await retry(async () => {
+      return await supabase
+        .from('ic_stats_data')
+        .select('ic')
+        .range(0, 999); // Limit to 1000 rows
+    });
+    console.timeEnd('Supabase ic-stats query');
+
+    if (error) {
+      console.error('Error fetching view:', {
+        message: error.message,
+        details: error.details || 'No details provided',
+        hint: error.hint || 'No hint provided',
+        code: error.code || 'No code provided'
+      });
+      throw error;
+    }
+
+    // Log raw data for debugging
+    console.log('Supabase raw data length:', data?.length || 0);
+    console.log('Supabase raw data sample:', data?.slice(0, 5));
+
+    // Count IC and total trains
+    let totalIC = 0;
+    let totalTrains = 0;
+
+    (data || []).forEach(row => {
+      if (row.ic === 'Y') {
+        totalIC++;
+      }
+      totalTrains++;
+    });
+
+    const dataResponse = [
+      { name: "Interchanged Trains", value: totalIC },
+      { name: "Non-Interchanged Trains", value: totalTrains - totalIC }
+    ];
+
+    const response = { success: true, data: dataResponse };
+
+    res.json(response);
+  } catch (err) {
+    console.error("Error in /api/ic-stats:", {
+      message: err.message,
+      stack: err.stack || 'No stack trace',
+      details: err.details || 'No additional details',
+      code: err.code || 'No code provided'
+    });
+    res.status(500).json({
+      success: false,
+      message: "Server error fetching IC stats",
+      error: err.message
+    });
+  }
+});
+
+app.post("/api/login", async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    // Supabase equivalent of the MySQL query
+    const { data: users, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('username', username.trim())
+      .eq('password', password);
+
+    if (error) throw error;
+
+    if (users && users.length > 0) {
+      const user = users[0];
+
+      // Create JWT token (same as original)
+      const token = jwt.sign(
+        {
+          id: user.id,
+          username: user.username,
+          role: user.role,
+          designation: user.designation,
+          firstName: user.firstname,
+          lastName: user.lastname,
+          email: user.email
+        },
+        SECRET,
+        { expiresIn: "1d" }
+      );
+
+      // Send as httpOnly cookie (same as original)
+      res.cookie("token", token, {
+        httpOnly: true,
+        secure: true,
+        sameSite: "none",
+        maxAge: 24 * 60 * 60 * 1000
+      });
+
+      return res.json({ success: true });
+    } else {
+      f
+      return res.json({ success: false, message: "Invalid username or password" });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Error connecting to server" });
+  }
+});
+
+app.post("/api/logout", (req, res) => {
+  res.clearCookie("token", {
+    httpOnly: true,
+    secure: false,
+    sameSite: "lax"
+  });
+  res.json({ success: true });
+});
+
+app.get("/auth/check", (req, res) => {
+  const token = req.cookies.token;
+  if (!token) return res.json({ loggedIn: false });
+
+  try {
+    const decoded = jwt.verify(token, SECRET);
+    res.json({ loggedIn: true, user: decoded });
+  } catch {
+    res.json({ loggedIn: false });
+  }
+});
 
 
 
@@ -131,208 +440,8 @@ const allowedTables = [
   "sc_tjsp", "tjsp_sc"
 ];
 
-app.post("/api/login", async (req, res) => {
-  try {
-    const { username, password } = req.body;
 
-    if (!username || !password) {
-      return res.status(400).json({ success: false, message: "Username and password are required" });
-    }
-
-    // 🔹 Fetch user from Supabase users table
-    const { data: users, error } = await supabase
-      .from("users")
-      .select("*")
-      .eq("username", username)
-      .limit(1);
-
-    if (error) {
-      console.error("Supabase fetch error:", error);
-      return res.status(500).json({ success: false, message: "Database error while fetching user" });
-    }
-
-    if (!users || users.length === 0) {
-      return res.status(401).json({ success: false, message: "Invalid username" });
-    }
-
-    const user = users[0];
-
-    // ⚠️ Compare plain text passwords (for now)
-    // In future: store hashed passwords and use bcrypt.compare()
-    if (password !== user.password) {
-      return res.status(401).json({ success: false, message: "Invalid password" });
-    }
-
-    // ✅ Create a JWT token
-    const token = jwt.sign(
-      { id: user.id, username: user.username, role: user.role },
-      SECRET,
-      { expiresIn: "2h" }
-    );
-
-    // Store token in a cookie
-    res.cookie("token", token, { httpOnly: true, sameSite: "lax" });
-
-    // Send response
-    res.json({
-      success: true,
-      message: "Login successful",
-      user: {
-        id: user.id,
-        username: user.username,
-        firstname: user.firstname,
-        lastname: user.lastname,
-        email: user.email,
-        role: user.role,
-        designation: user.designation
-      },
-      token
-    });
-
-  } catch (err) {
-    console.error("Login error:", err);
-    res.status(500).json({ success: false, message: "Internal server error" });
-  }
-});
-
-app.get("/api/forecast-vs-actual", async (req, res) => {
-  try {
-    // Fetch data from forecast_data table
-    const { data: rows, error } = await supabase
-      .from("forecast_data")
-      .select("arrival, fc, ic")
-      .not("arrival", "is", null);
-
-    if (error) throw error;
-
-    // Initialize counters for each time period
-    const results = {
-      Morning: { forecasted: 0, actual: 0 },
-      Afternoon: { forecasted: 0, actual: 0 },
-      Evening: { forecasted: 0, actual: 0 },
-      Night: { forecasted: 0, actual: 0 }
-    };
-
-    // Group data by time period
-    rows.forEach(row => {
-      if (!row.arrival || typeof row.arrival !== "string") return;
-
-      const timeMatch = row.arrival.match(/^(\d{2}):(\d{2}):(\d{2})$/);
-      if (!timeMatch) return;
-
-      const hour = parseInt(timeMatch[1], 10);
-      let period;
-
-      if (hour >= 6 && hour <= 11) period = "Morning";
-      else if (hour >= 12 && hour <= 17) period = "Afternoon";
-      else if (hour >= 18 && hour <= 23) period = "Evening";
-      else period = "Night";
-
-      if (row.fc === "Y") results[period].forecasted++;
-      if (row.ic === "Y") results[period].actual++;
-    });
-
-    // Convert to chart-friendly format
-    const chartData = Object.entries(results).map(([period, counts]) => ({
-      period,
-      forecasted: counts.forecasted,
-      actual: counts.actual
-    }));
-
-    // Sort order: Morning → Afternoon → Evening → Night
-    chartData.sort(
-      (a, b) =>
-        ["Morning", "Afternoon", "Evening", "Night"].indexOf(a.period) -
-        ["Morning", "Afternoon", "Evening", "Night"].indexOf(b.period)
-    );
-
-    res.json({
-      success: true,
-      data: chartData
-    });
-  } catch (err) {
-    console.error("Error in /api/forecast-vs-actual:", err);
-    res.status(500).json({
-      success: false,
-      message: "Server error fetching forecast vs actual data"
-    });
-  }
-});
-
-
-app.get("/api/wagon-totals", async (req, res) => {
-  // Simple retry helper for transient errors
-  const retry = async (fn, retries = 3, delay = 1000) => {
-    for (let i = 0; i < retries; i++) {
-      try {
-        return await fn();
-      } catch (err) {
-        if (i === retries - 1) throw err;
-        console.warn(`Retry ${i + 1}/${retries} failed: ${err.message}`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-  };
-
-  try {
-    console.time("Supabase wagon-totals query");
-
-    // Fetch from Supabase view/table `wagon_totals_data`
-    const { data, error } = await retry(async () => {
-      const result = await supabase
-        .from("wagon_totals_data")
-        .select("wagon, isloaded")
-        .range(0, 999); // limit 1000 rows
-      if (result.error) throw result.error;
-      return result;
-    });
-
-    console.timeEnd("Supabase wagon-totals query");
-
-    if (error) throw error;
-
-    console.log("Supabase raw data length:", data?.length || 0);
-    console.log("Supabase raw data sample:", data?.slice(0, 5));
-
-    // Initialize totals
-    let totalLoaded = 0;
-    let totalEmpty = 0;
-
-    // Process each row
-    (data || []).forEach(row => {
-      const wagons = Number(row.wagon) || 0;
-      if (row.isloaded === "L") {
-        totalLoaded += wagons;
-      } else if (row.isloaded === "E") {
-        totalEmpty += wagons;
-      }
-    });
-
-    // Prepare final response
-    const resultData = [
-      { name: "Loaded Wagons", value: totalLoaded },
-      { name: "Empty Wagons", value: totalEmpty }
-    ];
-
-    res.json({
-      success: true,
-      data: resultData
-    });
-  } catch (err) {
-    console.error("Error in /api/wagon-totals:", {
-      message: err.message,
-      stack: err.stack || "No stack trace",
-      details: err.details || "No additional details",
-      code: err.code || "No code provided"
-    });
-
-    res.status(500).json({
-      success: false,
-      message: "Server error fetching wagon totals",
-      error: err.message
-    });
-  }
-});
+// Add this route to server.js
 
 function authenticateUser(req, res, next) {
   const token = req.cookies.token;
@@ -347,6 +456,372 @@ function authenticateUser(req, res, next) {
     res.status(403).json({ message: "Invalid token" });
   }
 }
+
+
+app.get("/api/summary/:type", async (req, res) => {
+  const type = (req.params.type || "").toLowerCase();
+  const allowedTypes = ["master", "forecasted", "interchanged", "remaining"];
+  if (!allowedTypes.includes(type)) {
+    return res.status(400).json({ success: false, message: "Invalid summary type" });
+  }
+
+  try {
+    // Check cache first
+    const cacheKey = `summary_${type}`;
+    const cachedData = cache.get(cacheKey);
+    if (cachedData) {
+      console.log(`Cache hit for summary_${type}`);
+      return res.json(cachedData);
+    }
+
+    console.time("dbQuery");
+
+    // Select the appropriate view based on type
+    const viewName = `summary_${type === "interchanged" ? "interchanged" : type}`;
+    const { data, error } = await supabase
+      .from(viewName)
+      .select('route, *');
+
+    if (error) {
+      console.error(`Error fetching view ${viewName}:`, {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code
+      });
+      throw error;
+    }
+
+
+    // Group data by table
+    const results = [];
+    const tableData = {};
+    (data || []).forEach(row => {
+      if (!tableData[row.route]) {
+        tableData[row.route] = [];
+      }
+      // Remove route from row to match original data structure
+      const { route, ...rowData } = row;
+      tableData[row.route].push(rowData);
+    });
+
+    // Build results in the same order as routePairs
+    const routePairs = [
+      ["sc_wadi", "wadi_sc"],
+      ["gtl_wadi", "wadi_gtl"],
+      ["ubl_hg", "hg_ubl"],
+      ["ltrr_sc", "sc_ltrr"],
+      ["pune_dd", "dd_pune"],
+      ["mrj_pune", "pune_mrj"],
+      ["sc_tjsp", "tjsp_sc"]
+    ];
+
+    routePairs.flat().forEach(table => {
+      results.push({
+        table,
+        data: tableData[table] || []
+      });
+    });
+
+    console.timeEnd("processing");
+
+    const response = { success: true, data: results };
+
+    // Cache the response
+    cache.set(cacheKey, response);
+    console.log(`Cache set for summary_${type}`);
+
+    res.json(response);
+  } catch (err) {
+    console.error(`Error in /api/summary/${type}:`, {
+      message: err.message,
+      stack: err.stack,
+      details: err.details || "No additional details"
+    });
+    res.status(500).json({ success: false, message: "Server error fetching summary" });
+  }
+});
+
+app.get("/api/get-user-and-role", authenticateUser, (req, res) => {
+  res.json({
+    username: req.user.username,
+    role: req.user.role,
+    designation: req.user.designation,
+    email: req.user.email,
+    firstName: req.user.firstName,
+    lastName: req.user.lastName
+  });
+});
+
+app.post("/api/add-user", async (req, res) => {
+  try {
+    const { username, password, email, role, designation, firstName, lastName } = req.body;
+
+    if (!username || !password || !email || !role) {
+      return res.status(400).json({ success: false, message: "Missing required fields" });
+    }
+
+    // Insert directly into Supabase (password stored as plain text)
+    const { data, error } = await supabase
+      .from("users")
+      .insert([
+        {
+          username,
+          password,       // ⚠️ stored as plain text
+          email,
+          role,
+          designation,
+          firstname: firstName, // use your actual DB column names
+          lastname: lastName,
+        }
+      ])
+      .select();
+
+    if (error) {
+      console.error("Supabase insert error:", error);
+      if (error && error.code === "23505") {
+        return res.status(400).json({ success: false, message: "Username already exists" });
+      }
+      return res.status(500).json({ success: false, message: "Database Insertion Failed", error });
+    }
+
+    return res.status(201).json({ success: true, user: data[0] });
+  } catch (err) {
+    console.error("Server error:", err);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+app.get("/api/users/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { error } = await supabase
+      .from("users")
+      .delete()
+      .eq("id", id);
+
+    if (error) {
+      console.error("Supabase delete error:", error);
+      return res.status(500).json({ success: false, message: "Failed to delete user" });
+    }
+
+    return res.json({ success: true, message: "User deleted successfully" });
+  } catch (err) {
+    console.error("Server error:", err);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+app.get("/api/users", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("users")
+      .select("*");
+
+    if (error) {
+      console.error("Supabase fetch error:", error);
+      return res.status(500).json({ success: false, message: "Failed to fetch users" });
+    }
+
+    return res.json({ success: true, users: data });
+  } catch (err) {
+    console.error("Server error:", err);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+// Add this endpoint to your server.js
+app.get("/api/forecast-vs-actual", async (req, res) => {
+  const tables = [
+    "sc_wadi", "wadi_sc", "gtl_wadi", "wadi_gtl", "ubl_hg", "hg_ubl",
+    "ltrr_sc", "sc_ltrr", "pune_dd", "dd_pune", "mrj_pune", "pune_mrj",
+    "sc_tjsp", "tjsp_sc"
+  ];
+
+
+  try {
+    let results = {
+      Morning: { forecasted: 0, actual: 0 },
+      Afternoon: { forecasted: 0, actual: 0 },
+      Evening: { forecasted: 0, actual: 0 },
+      Night: { forecasted: 0, actual: 0 }
+    };
+
+    // First get all relevant data from the table
+    const { data: rows, error } = await supabase
+      .from('forecast_data')
+      .select('arrival, fc, ic')
+      .not('arrival', 'is', null);
+    if (error) throw error;
+    const allRows = rows || [];
+    // Process allRows as above
+    if (error) throw error;
+
+    // Process rows in JavaScript instead of SQL
+    const timePeriods = rows.reduce((acc, row) => {
+      if (!row.arrival || typeof row.arrival !== 'string') {
+        console.warn(`Skipping row with invalid arrival: ${row.arrival}`);
+        return acc;
+      }
+      // Ensure arrival is a valid HH:MM:SS format
+      const timeMatch = row.arrival.match(/^(\d{2}):(\d{2}):(\d{2})$/);
+      if (!timeMatch) {
+        console.warn(`Invalid time format for arrival: ${row.arrival}`);
+        return acc;
+      }
+      const hour = parseInt(timeMatch[1], 10);
+      let period;
+
+      if (hour >= 6 && hour <= 11) period = 'Morning';
+      else if (hour >= 12 && hour <= 17) period = 'Afternoon';
+      else if (hour >= 18 && hour <= 23) period = 'Evening';
+      else period = 'Night';
+
+      if (!acc[period]) {
+        acc[period] = { forecasted: 0, actual: 0 };
+      }
+
+      if (row.fc === 'Y') acc[period].forecasted++;
+      if (row.ic === 'Y') acc[period].actual++;
+
+      return acc;
+    }, {});
+
+    // Aggregate results
+    Object.entries(timePeriods).forEach(([period, counts]) => {
+      results[period].forecasted += counts.forecasted;
+      results[period].actual += counts.actual;
+    });
+
+    // Convert to array format for frontend (same as original)
+    const chartData = Object.entries(results).map(([period, counts]) => ({
+      period,
+      forecasted: counts.forecasted,
+      actual: counts.actual
+    }));
+
+    return res.json({
+      success: true,
+      data: chartData.sort((a, b) =>
+        ['Morning', 'Afternoon', 'Evening', 'Night'].indexOf(a.period) -
+        ['Morning', 'Afternoon', 'Evening', 'Night'].indexOf(b.period)
+      )
+    });
+
+  } catch (err) {
+    console.error("Error in /api/forecast-vs-actual:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Server error fetching forecast comparison data"
+    });
+  }
+});
+
+app.get("/api/wagon-summary", async (req, res) => {
+  const tables = [
+    "sc_wadi", "wadi_sc", "gtl_wadi", "wadi_gtl", "ubl_hg", "hg_ubl",
+    "ltrr_sc", "sc_ltrr", "pune_dd", "dd_pune", "mrj_pune", "pune_mrj",
+    "sc_tjsp", "tjsp_sc"
+  ];
+
+  try {
+    // Check cache first
+    const cacheKey = 'wagon_summary';
+    const cachedData = cache.get(cacheKey);
+    if (cachedData) {
+      return res.json(cachedData);
+    }
+
+
+    // Query the view
+    const { data, error } = await supabase
+      .from('wagon_summary_data')
+      .select('route, isloaded');
+
+    if (error) {
+      console.error('Error fetching view:', {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code
+      });
+      throw error;
+    }
+
+
+    // Initialize counts for each table
+    const tableCounts = {};
+    tables.forEach(table => {
+      tableCounts[table] = { loaded_wagons: 0, empty_wagons: 0 };
+    });
+
+    // Process rows
+    (data || []).forEach(row => {
+      if (tableCounts[row.route]) {
+        if (row.isloaded === 'L') {
+          tableCounts[row.route].loaded_wagons++;
+        } else if (row.isloaded === 'E') {
+          tableCounts[row.route].empty_wagons++;
+        }
+      }
+    });
+
+    // Build summary
+    const summary = tables.map(table => ({
+      route: table.toUpperCase(),
+      loaded_wagons: tableCounts[table].loaded_wagons,
+      empty_wagons: tableCounts[table].empty_wagons
+    })).sort((a, b) => a.route.localeCompare(b.route));
+
+
+    const response = { success: true, data: summary };
+
+    // Cache the response
+    cache.set(cacheKey, response);
+
+    res.json(response);
+  } catch (err) {
+    console.error("Error in /api/wagon-summary:", {
+      message: err.message,
+      stack: err.stack,
+      details: err.details || "No additional details"
+    });
+    res.status(500).json({
+      success: false,
+      message: "Server error fetching wagon summary"
+    });
+  }
+});
+
+async function applyOverrides() {
+  try {
+
+    // Fetch all overrides
+    const { data: overrides, error: fetchError } = await supabase
+      .from('useroverrides')
+      .select('*');
+
+    if (fetchError) throw fetchError;
+
+    // Apply updates for each override
+    for (const row of overrides) {
+      const { tablename, rake_id, column_name, new: newValue } = row;
+      console.log(tablename, rake_id, column_name, newValue);
+      if (!tablename || !rake_id || !column_name) continue;
+
+      const { error: updateError } = await supabase
+        .from(tablename)
+        .update({ [column_name.toLowerCase()]: newValue })
+        .eq("rake_id", rake_id);
+
+      if (updateError) throw updateError;
+    }
+
+    console.log("UserOverrides applied to all route tables.");
+  } catch (err) {
+    console.error("Error applying user overrides:", err);
+  }
+}
 app.get("/api/ic-fc-stats", async (req, res) => {
   const tablePairs = [
     { src: "sc", dest: "wadi" },
@@ -358,7 +833,6 @@ app.get("/api/ic-fc-stats", async (req, res) => {
     { src: "sc", dest: "tjsp" }
   ];
 
-  // Simple retry helper for transient Supabase connection issues
   const retry = async (fn, retries = 3, delay = 1000) => {
     for (let i = 0; i < retries; i++) {
       try {
@@ -372,47 +846,49 @@ app.get("/api/ic-fc-stats", async (req, res) => {
   };
 
   try {
-    console.time("Supabase ic-fc-stats query");
-
-    // Build route names for both directions
-    const routes = tablePairs.flatMap(pair => [
-      `${pair.src}_${pair.dest}`,
-      `${pair.dest}_${pair.src}`
-    ]);
-
-    // Fetch IC and FC stats for all routes
+    // Query the view directly
+    console.time('Supabase ic-fc query');
     const { data, error } = await retry(async () => {
-      const result = await supabase
-        .from("ic_fc_stats_data")
-        .select("route, ic, fc")
-        .in("route", routes)
-        .range(0, 999); // limit 1000 rows
-      if (result.error) throw result.error;
-      return result;
+      return await supabase
+        .from('ic_fc_stats_data')
+        .select('route, ic, fc')
+        .in('route', tablePairs.flatMap(pair => [`${pair.src}_${pair.dest}`, `${pair.dest}_${pair.src}`]))
+        .range(0, 999); // Limit to 1000 rows
     });
+    console.timeEnd('Supabase ic-fc query');
 
-    console.timeEnd("Supabase ic-fc-stats query");
+    if (error) {
+      console.error('Error fetching view:', {
+        message: error.message,
+        details: error.details || 'No details provided',
+        hint: error.hint || 'No hint provided',
+        code: error.code || 'No code provided'
+      });
+      throw error;
+    }
 
-    if (error) throw error;
+    // Log raw data for debugging
+    console.log('Supabase raw data length:', data?.length || 0);
+    console.log('Supabase raw data sample:', data?.slice(0, 5));
 
-    console.log("Supabase raw data length:", data?.length || 0);
-    console.log("Supabase raw data sample:", data?.slice(0, 5));
-
-    // Initialize counts
+    // Initialize counts for each table
     const tableCounts = {};
-    routes.forEach(route => {
-      tableCounts[route] = { ic: 0, fc: 0 };
+    tablePairs.forEach(pair => {
+      const forwardTable = `${pair.src}_${pair.dest}`;
+      const reverseTable = `${pair.dest}_${pair.src}`;
+      tableCounts[forwardTable] = { ic: 0, fc: 0 };
+      tableCounts[reverseTable] = { ic: 0, fc: 0 };
     });
 
-    // Process rows
+    // Process rows to count IC and FC
     (data || []).forEach(row => {
       if (tableCounts[row.route]) {
-        if (row.ic === "Y") tableCounts[row.route].ic++;
-        if (row.fc === "Y") tableCounts[row.route].fc++;
+        if (row.ic === 'Y') tableCounts[row.route].ic++;
+        if (row.fc === 'Y') tableCounts[row.route].fc++;
       }
     });
 
-    // Format final result
+    // Build results
     const results = tablePairs.map(pair => {
       const forwardTable = `${pair.src}_${pair.dest}`;
       const reverseTable = `${pair.dest}_${pair.src}`;
@@ -420,13 +896,13 @@ app.get("/api/ic-fc-stats", async (req, res) => {
         pair: forwardTable,
         directions: [
           {
-            direction: "forward",
+            direction: 'forward',
             tableName: forwardTable,
             IC: tableCounts[forwardTable].ic,
             FC: tableCounts[forwardTable].fc
           },
           {
-            direction: "reverse",
+            direction: 'reverse',
             tableName: reverseTable,
             IC: tableCounts[reverseTable].ic,
             FC: tableCounts[reverseTable].fc
@@ -435,20 +911,16 @@ app.get("/api/ic-fc-stats", async (req, res) => {
       };
     });
 
-    // Send structured response
-    res.json({
-      success: true,
-      data: results
-    });
+    const response = { success: true, data: results };
 
+    res.json(response);
   } catch (err) {
     console.error("Error in /api/ic-fc-stats:", {
       message: err.message,
-      stack: err.stack || "No stack trace",
-      details: err.details || "No additional details",
-      code: err.code || "No code provided"
+      stack: err.stack || 'No stack trace',
+      details: err.details || 'No additional details',
+      code: err.code || 'No code provided'
     });
-
     res.status(500).json({
       success: false,
       message: "Server error fetching IC/FC stats",
@@ -456,80 +928,9 @@ app.get("/api/ic-fc-stats", async (req, res) => {
     });
   }
 });
-
-app.get("/api/ic-stats", async (req, res) => {
-  // Simple retry utility
-  const retry = async (fn, retries = 3, delay = 1000) => {
-    for (let i = 0; i < retries; i++) {
-      try {
-        return await fn();
-      } catch (err) {
-        if (i === retries - 1) throw err;
-        console.warn(`Retry ${i + 1}/${retries} failed: ${err.message}`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-  };
-
-  try {
-    console.time("Supabase ic-stats query");
-
-    // Fetch from Supabase table or view `ic_stats_data`
-    const { data, error } = await retry(async () => {
-      const result = await supabase
-        .from("ic_stats_data")
-        .select("ic")
-        .range(0, 999); // Limit to 1000 rows (adjust as needed)
-      if (result.error) throw result.error;
-      return result;
-    });
-
-    console.timeEnd("Supabase ic-stats query");
-
-    if (error) throw error;
-
-    console.log("Supabase raw data length:", data?.length || 0);
-    console.log("Supabase raw data sample:", data?.slice(0, 5));
-
-    // Initialize counts
-    let totalIC = 0;
-    let totalTrains = 0;
-
-    (data || []).forEach(row => {
-      totalTrains++;
-      if (row.ic === "Y") totalIC++;
-    });
-
-    // Prepare frontend chart data
-    const dataResponse = [
-      { name: "Interchanged Trains", value: totalIC },
-      { name: "Non-Interchanged Trains", value: totalTrains - totalIC }
-    ];
-
-    res.json({
-      success: true,
-      data: dataResponse
-    });
-  } catch (err) {
-    console.error("Error in /api/ic-stats:", {
-      message: err.message,
-      details: err.details || "No additional details",
-      hint: err.hint || "No hint provided",
-      code: err.code || "No code",
-      stack: err.stack || "No stack trace"
-    });
-
-    res.status(500).json({
-      success: false,
-      message: "Server error fetching IC stats",
-      error: err.message
-    });
-  }
-});
-
+const cache = new NodeCache({ stdTTL: 300 }); // Cache for 5 minutes
 
 app.get("/api/dashboard-stats", async (req, res) => {
-  // Define all route sections (same as table names)
   const tables = [
     "sc_wadi", "wadi_sc", "gtl_wadi", "wadi_gtl", "ubl_hg", "hg_ubl",
     "ltrr_sc", "sc_ltrr", "pune_dd", "dd_pune", "mrj_pune", "pune_mrj",
@@ -537,156 +938,177 @@ app.get("/api/dashboard-stats", async (req, res) => {
   ];
 
   try {
+    // Query the view
     const { data, error } = await supabase
-      .from("dashboard_stats_data")
-      .select("route, ic, fc");
+      .from('dashboard_stats_data')
+      .select('route, ic, fc');
 
     if (error) {
-      console.error("Supabase fetch error:", error);
-      return res.status(500).json({
-        success: false,
-        message: "Error fetching dashboard data",
-        error: error.message,
+      console.error('Error fetching view:', {
+        message: error.message,
+        details: error.details || 'No details provided',
+        hint: error.hint || 'No hint provided',
+        code: error.code || 'No code provided'
       });
+      throw error;
     }
 
-    if (!data || data.length === 0) {
-      return res.json({
-        success: true,
-        stats: { totalTrains: 0, totalInterchange: 0, totalForecast: 0 },
-        breakdown: tables.map((table) => ({ table, count: 0 })),
-      });
-    }
+    // Log raw data for debugging
+    console.log('Supabase raw data:', data);
 
+    // Initialize aggregates
     let totalICCount = 0;
     let totalFCCount = 0;
     let totalTrainCount = 0;
-
     const perTableCounts = {};
-    tables.forEach((table) => (perTableCounts[table] = { count: 0 }));
 
-    for (const row of data) {
-      totalTrainCount++;
+    // Initialize per-table counts
+    tables.forEach(table => {
+      perTableCounts[table] = { count: 0 };
+    });
 
-      if (row.ic === "Y") {
+    // Process rows
+    (data || []).forEach(row => {
+      if (row.ic === 'Y') {
         totalICCount++;
-        if (perTableCounts[row.route]) perTableCounts[row.route].count++;
+        perTableCounts[row.route].count++;
       }
-
-      if (row.fc === "Y") {
+      if (row.fc === 'Y') {
         totalFCCount++;
       }
-    }
+      totalTrainCount++;
+    });
 
+    // Convert perTableCounts to array
     const breakdown = Object.entries(perTableCounts).map(([table, { count }]) => ({
       table,
-      count,
+      count
     }));
 
-    res.json({
+    const response = {
       success: true,
       stats: {
         totalTrains: totalTrainCount,
         totalInterchange: totalICCount,
         totalForecast: totalFCCount,
       },
-      breakdown,
-    });
+      breakdown
+    };
 
+    res.json(response);
   } catch (err) {
-    console.error("Error in /api/dashboard-stats:", err);
+    console.error("Error in /api/dashboard-stats:", {
+      message: err.message,
+      stack: err.stack || 'No stack trace',
+      details: err.details || 'No additional details',
+      code: err.code || 'No code provided'
+    });
     res.status(500).json({
       success: false,
       message: "Server error fetching dashboard statistics",
-      error: err.message,
+      error: err.message
     });
   }
 });
 
-
-app.get("/api/get-user-and-role", authenticateUser, async (req, res) => {
+app.get("/api/route/:tableName", async (req, res) => {
   try {
-    // req.user should have been set by your authenticateUser middleware (from JWT)
-    const userId = req.user.id;
+    const tableName = req.params.tableName.toLowerCase();
 
-    // Fetch fresh user data from Supabase (optional but more accurate)
-    const { data: userData, error } = await supabase
-      .from("users")
-      .select("username, role, designation, email, firstname, lastname")
-      .eq("id", userId)
-      .single();
-
-    if (error || !userData) {
-      return res.status(404).json({ success: false, message: "User not found" });
+    // Make sure to define allowedTables somewhere in your code
+    // Example: const allowedTables = ["SC-WADI", "WADI-SC", ...];
+    if (!allowedTables.includes(tableName)) {
+      return res.status(400).json({ success: false, message: "Invalid route" });
     }
 
-    // Respond with structured data
-    res.json({
-      success: true,
-      username: userData.username,
-      role: userData.role,
-      designation: userData.designation,
-      email: userData.email,
-      firstName: userData.firstname,
-      lastName: userData.lastname
-    });
-  } catch (err) {
-    console.error("Error fetching user:", err);
+    // Supabase equivalent query
+    const { data, error } = await supabase
+      .from(tableName)
+      .select('*');
+
+    if (error) throw error;
+
+    res.json({ success: true, data });
+
+  } catch (error) {
+    console.error("Error fetching route data:", error);
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
-app.get("/api/fetch-handing-over", async (req, res) => {
-  const tables = [
-    "wadi_sc", "wadi_gtl", "hg_ubl", "sc_ltrr", "pune_mrj", "dd_pune", "tjsp_sc"
-  ];
+
+app.get("/api/save-table", async (req, res) => {
+  const { tableName, rake_id, column, value, original } = req.query;
+  console.log("Request params:", { tableName, rake_id, column, value, original });
+
+  if (!rake_id || !column) {
+    return res.status(400).json({ error: "Missing parameters" });
+  }
 
   try {
-    const results = {};
+    // Update the main table
+    const { error: updateError, data: updateData } = await supabase
+      .from(tableName)
+      .update({ [column.toLowerCase()]: value })
+      .eq("rake_id", rake_id);
 
-    for (const table of tables) {
-      const { data, error } = await supabase.from(table).select("*");
-      if (error) {
-        console.error(`Error fetching ${table}:`, error);
-        results[table] = { error: error.message };
-        continue; // skip this table but continue with others
-      }
-      results[table] = data;
+    console.log("Main table update result:", { updateError, updateData });
+    if (updateError) throw updateError;
+
+    // Check if the rake_id and column_name combination exists
+    const { count } = await supabase
+      .from('useroverrides')
+      .select('*', { count: 'exact', head: true })
+      .eq('rake_id', rake_id)
+      .eq('column_name', column.toLowerCase());
+
+    console.log("Exists check count:", count);
+    const exists = count > 0;
+
+    if (exists) {
+      // Update only the 'new' column if the combination exists
+      const { error: updateOverrideError, data: updateOverrideData } = await supabase
+        .from('useroverrides')
+        .update({ new: value, time: new Date().toISOString() })
+        .eq('rake_id', rake_id)
+        .eq('column_name', column.toLowerCase());
+
+      console.log("Override update result:", { updateOverrideError, updateOverrideData });
+      if (updateOverrideError) throw updateOverrideError;
+    } else {
+      // Insert a new row if the combination doesn't exist
+      const { error: insertOverrideError, data: insertOverrideData } = await supabase
+        .from('useroverrides')
+        .insert({
+          rake_id,
+          new: value,
+          firstvalue: original,
+          tablename: tableName,
+          column_name: column,
+          time: new Date().toISOString(),
+        });
+
+      console.log("Override insert result:", { insertOverrideError, insertOverrideData });
+      if (insertOverrideError) throw insertOverrideError;
     }
 
-    res.json({ success: true, data: results });
+    res.json({ success: true, rake_id, column, value });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error("Error saving table:", err);
+    res.status(500).json({ error: "Failed to save" });
   }
 });
 
-app.get("/api/fetch-data", async (req, res) => {
-  const tables = [
-    "sc_wadi",
-    "gtl_wadi",
-    "ubl_hg",
-    "ltrr_sc",
-    "mrj_pune",
-    "pune_dd",
-    "sc_tjsp",
-  ];
 
+app.get("/api/clear-all-data", async (req, res) => {
   try {
-    const results = {};
+    const { error } = await supabase.rpc("truncate_all_tables");
+    if (error) throw error;
 
-    for (const table of tables) {
-      const { data, error } = await supabase.from(table).select("*");
-      if (error) {
-        console.error(`Error fetching ${table}:`, error);
-        results[table] = { error: error.message };
-        continue; // skip this table but continue with others
-      }
-      results[table] = data;
-    }
-
-    res.json({ success: true, data: results });
+    res.json({ success: true, message: "All tables truncated successfully" });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error("Error truncating tables:", err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -705,6 +1127,7 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
 
     // Process routes
     const processedRoutes = await processExcelData(data);
+    await applyOverrides();
     res.json({
       success: true,
       message: "Database updated successfully",
@@ -991,6 +1414,8 @@ async function updateRouteTable(tableName, rakes) {
     return insertedCount;
 
   } catch (error) {
+    // console.error(`Error updating ${tableName}:`, error);
+    // throw new Error(`Database update failed for ${tableName}`);
   }
 }
 
