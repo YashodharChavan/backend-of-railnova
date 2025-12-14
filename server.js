@@ -555,26 +555,34 @@ app.get("/api/summary/:type", async (req, res) => {
 
 app.get("/api/get-user-and-role", (req, res) => {
   try {
-    const token = req.cookies?.token;
-    if (!token) {
-      return res.status(401).json({ message: "No token" });
+    const authHeader = req.headers.authorization;
+
+    // ❌ No Authorization header
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ message: "No token provided" });
     }
 
+    // ✅ Extract token
+    const token = authHeader.split(" ")[1];
+
+    // ✅ Verify token
     const decoded = jwt.verify(token, SECRET);
 
+    // ✅ Send user data
     res.json({
       username: decoded.username,
       role: decoded.role,
       designation: decoded.designation,
       email: decoded.email,
       firstName: decoded.firstName,
-      lastName: decoded.lastName
+      lastName: decoded.lastName,
     });
   } catch (err) {
     console.error("get-user-and-role error:", err);
-    res.status(401).json({ message: "Invalid token" });
+    res.status(401).json({ message: "Invalid or expired token" });
   }
 });
+
 
 
 app.post("/api/add-user", async (req, res) => {
