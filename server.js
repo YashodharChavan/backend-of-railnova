@@ -29,7 +29,7 @@ const upload = multer({
 app.use(cookieParser());
 app.use(
   cors({
-    origin: "https://rail-nova.vercel.app/",
+    origin: "https://rail-nova.vercel.app",
     methods: ["GET", "POST"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true
