@@ -229,6 +229,10 @@ app.get("/api/wagon-totals", async (req, res) => {
   }
 });
 
+app.get("/", (req, res)=> {
+
+  res.json({success: true});
+})
 
 app.get("/api/ic-stats", async (req, res) => {
   const retry = async (fn, retries = 3, delay = 1000) => {
